@@ -1,39 +1,7 @@
-/*
- * Copyright (c) 2017 Simon Goldschmidt
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without modification,
- * are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice,
- *    this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- * 3. The name of the author may not be used to endorse or promote products
- *    derived from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
- * SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
- * OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
- * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
- * OF SUCH DAMAGE.
- *
- * This file is part of the lwIP TCP/IP stack.
- *
- * Author: Simon Goldschmidt <goldsimon@gmx.de>
- *
- */
-
 /* ========================================================================== */
 /*                             Include Files                                  */
 /* ========================================================================== */
-#include "app_udpclient.h"
+#include "app_udpclient.h" // Keep original header for build compatibility
 
 #include "lwip/opt.h"
 #include "lwip/sockets.h"
@@ -41,164 +9,168 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <inttypes.h>
+
+/* FreeRTOS Headers for Threading and Mutex */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
 #include <kernel/dpl/TaskP.h>
 #include <kernel/dpl/ClockP.h>
 #include <kernel/dpl/CacheP.h>
 #include "enet_apputils.h"
+
 /* ========================================================================== */
 /*                           Macros & Typedefs                                */
 /* ========================================================================== */
-#define SOCK_HOST_SERVER_IP6  ("FE80::12:34FF:FE56:78AB")
+#define SERVER_UDP_PORT     (8016)
+#define MAX_LOGS            (30)  // Store the last 100 logs
+#define TX_BUFFER_SIZE      (1024)
+#define RX_BUFFER_SIZE      (128)
 
-#define SOCK_HOST_SERVER_PORT  (8888)
-
-#define APP_SOCKET_MAX_RX_DATA_LEN (1024U)
-
-#define APP_SOCKET_NUM_ITERATIONS (1U)
-
-#define APP_SEND_DATA_NUM_ITERATIONS (5U)
-
-#define MAX_IPV4_STRING_LEN (16U)
-
-#define R5F_CACHE_LINE_SIZE  (32)
-
-#define UTILS_ALIGN(x,align)  ((((x) + ((align) - 1))/(align)) * (align))
-
-char snd_buf[UTILS_ALIGN(APP_SOCKET_MAX_RX_DATA_LEN,R5F_CACHE_LINE_SIZE)];
-
-#if !LWIP_SOCKET
-#error "LWIP_SOCKET is not set! enable socket support in LwIP"
-#endif
-
-
-
-/* ========================================================================== */
-/*                         Structure Declarations                             */
-/* ========================================================================== */
-
-struct App_hostInfo_t
-{
-    struct sockaddr_in socketAddr;
-};
-
-/* ========================================================================== */
-/*                          Function Declarations                             */
-/* ========================================================================== */
-static void Appsocket_fillHostSocketInfo(struct App_hostInfo_t* pHostInfo);
+/* Requirement: Data structure with at least 3 items */
+typedef struct {
+    uint32_t timestamp;
+    uint8_t  type;          // 0 = INFO, 1 = WARN, 2 = ERROR
+    float    temperature;
+    float    voltage;
+} LogItem_t;
 
 /* ========================================================================== */
 /*                            Global Variables                                */
 /* ========================================================================== */
-
-static uint8_t gRxDataBuff[APP_SOCKET_MAX_RX_DATA_LEN];
-
-static struct App_hostInfo_t gHostInfo;
-
-static char   gHostServerIp4[MAX_IPV4_STRING_LEN] = "";
+static LogItem_t gLogBuffer[MAX_LOGS];
+static uint32_t gLogIndex = 0;
+static uint32_t gTotalLogs = 0;
+static SemaphoreHandle_t gLogMutex = NULL;
 
 /* ========================================================================== */
 /*                          Function Definitions                              */
 /* ========================================================================== */
 
-
-static void Appsocket_fillHostSocketInfo(struct App_hostInfo_t* pHostInfo)
+/* THREAD 1: Data Generator Task (Runs every 100ms) */
+static void AppSocket_dataGeneratorTask(void *pArg)
 {
-    ip_addr_t ipAddr;
-    int32_t addr_ok;
-    memset(&pHostInfo->socketAddr, 0, sizeof(pHostInfo->socketAddr));
+    uint32_t currentTimeMs = 0;
 
-    struct sockaddr_in*  pAddr = &pHostInfo->socketAddr;
-    IP_SET_TYPE_VAL(dstaddr, IPADDR_TYPE_V4);
-    addr_ok = ip4addr_aton(gHostServerIp4, ip_2_ip4(&ipAddr));
-    pAddr->sin_len = sizeof(pHostInfo->socketAddr);
-    pAddr->sin_family = AF_INET;
-    pAddr->sin_port = PP_HTONS(SOCK_HOST_SERVER_PORT);
-    inet_addr_from_ip4addr(&pAddr->sin_addr, ip_2_ip4(&ipAddr));
-    EnetAppUtils_assert(addr_ok);
+    EnetAppUtils_print("Data Generator Thread Started...\r\n");
 
-    return;
-}
-
-static void AppSocket_simpleClient(void* pArg)
-{
-    struct sockaddr* pAddr = pArg;
-    int32_t sock = -1, ret = 0;
-    uint32_t len = 0, buf_len = 0;
-    struct timeval opt = {0};
-
-    for (uint32_t i = 0; i < APP_SOCKET_NUM_ITERATIONS; i++)
+    while (1)
     {
-        EnetAppUtils_print("<<< Iteration %" PRId32 ">>>> \r\n", i+1);
-        EnetAppUtils_print(" Connecting to: %s:%" PRId32 "\r\n", gHostServerIp4, SOCK_HOST_SERVER_PORT);
-
-        /* create the socket */
-        sock = lwip_socket(pAddr->sa_family, SOCK_DGRAM, 0);
-        if (sock < 0)
+        /* Lock Mutex to prevent UDP server from reading while we write */
+        if (xSemaphoreTake(gLogMutex, portMAX_DELAY) == pdTRUE)
         {
-            EnetAppUtils_print("ERR: unable to open socket\r\n");
-            continue;
+            // Generate simulated telemetry data
+            gLogBuffer[gLogIndex].timestamp = currentTimeMs;
+            gLogBuffer[gLogIndex].type = rand() % 3; 
+            gLogBuffer[gLogIndex].temperature = 20.0f + ((float)(rand() % 100) / 10.0f);
+            gLogBuffer[gLogIndex].voltage = 5.0f - ((float)(rand() % 10) / 10.0f);
+
+            gLogIndex = (gLogIndex + 1) % MAX_LOGS; // Circular buffer wrap
+            if (gTotalLogs < MAX_LOGS) gTotalLogs++;
+
+            currentTimeMs += 100;
+
+            xSemaphoreGive(gLogMutex); /* Unlock Mutex */
         }
 
-        /* set recv timeout (100 ms) */
-        opt.tv_sec = 0;
-        opt.tv_usec = 100 * 1000;
-        ret = lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &opt, sizeof(opt));
-        if (ret != 0)
-        {
-            ret = lwip_close(sock);
-            EnetAppUtils_print("ERR: set sockopt failed\r\n");
-            continue;
-        }
-
-        /* Send data to Host */
-        for ( uint32_t i = 0; i < APP_SEND_DATA_NUM_ITERATIONS; i++)
-        {
-            memset(&snd_buf, 0, sizeof(snd_buf));
-            buf_len = snprintf(snd_buf, sizeof(snd_buf), "Hello over UDP %" PRId32 "\r\n", i);
-
-            CacheP_wbInv(snd_buf, sizeof(snd_buf), CacheP_TYPE_ALLD);
-            ret = lwip_sendto(sock, snd_buf, buf_len, 0,
-                    pAddr, sizeof(*pAddr));
-            if (ret != buf_len)
-            {
-                ret = lwip_close(sock);
-                EnetAppUtils_print("ERR: socket write failed\r\n");
-                continue;
-            }
-            EnetAppUtils_print("Message to host: %s\r\n", snd_buf);
-
-            ret = lwip_recvfrom(sock, gRxDataBuff, APP_SOCKET_MAX_RX_DATA_LEN, 0, pAddr, &len);
-            gRxDataBuff[ret] = '\0';
-            EnetAppUtils_print("Message from host: %s\r\n", gRxDataBuff);
-        }
-
-        /* close */
-        ret = lwip_close(sock);
-        EnetAppUtils_print("Closed Socket connection\r\n");
-        ClockP_sleep(2);
+        /* Sleep exactly 100ms per requirement */
+        ClockP_sleep(0); // Yield
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
-    return;
 }
 
-void AppSocket_showMenu(void)
+/* THREAD 2: UDP Server Task (Listens on Port 8016) */
+static void AppSocket_udpServerTask(void *pArg)
 {
-    ip_addr_t ipAddr;
-    int32_t addr_ok = 0;
-    EnetAppUtils_print(" UDP socket Menu: \r\n");
+    int32_t sock = -1, ret = 0;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    char rx_buffer[RX_BUFFER_SIZE];
+    char tx_buffer[TX_BUFFER_SIZE];
 
-    do
+    EnetAppUtils_print("UDP Server Thread Started on Port %d...\r\n", SERVER_UDP_PORT);
+
+    /* Create the socket */
+    sock = lwip_socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
     {
-        EnetAppUtils_print(" Enter server IPv4 address:(example: 192.168.101.100)\r\n");
-        DebugP_scanf("%s", gHostServerIp4);
-        addr_ok = ip4addr_aton(gHostServerIp4, ip_2_ip4(&ipAddr));
-        TaskP_yield();
-    } while (addr_ok != 1);
+        EnetAppUtils_print("ERR: unable to open socket\r\n");
+        vTaskDelete(NULL);
+    }
+
+    /* Bind the socket to Port 8016 */
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = PP_HTONS(SERVER_UDP_PORT);
+    server_addr.sin_addr.s_addr = PP_HTONL(INADDR_ANY);
+
+    ret = lwip_bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (ret < 0)
+    {
+        EnetAppUtils_print("ERR: socket bind failed\r\n");
+        lwip_close(sock);
+        vTaskDelete(NULL);
+    }
+
+    /* Main Server Loop */
+    while (1)
+    {
+        // Block and wait for ANY packet from Thomas's Client
+        int len = lwip_recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                                (struct sockaddr *)&client_addr, &client_len);
+
+        if (len > 0)
+        {
+            rx_buffer[len] = '\0'; // Null terminate received string
+            tx_buffer[0] = '\0';   // Clear transmit buffer
+            
+            EnetAppUtils_print("Received a trigger packet! Sending all logs...\r\n");
+
+            /* Lock Mutex to safely read logs */
+            if (xSemaphoreTake(gLogMutex, portMAX_DELAY) == pdTRUE)
+            {
+                // Send all available logs currently in the buffer
+                int start = (gTotalLogs < MAX_LOGS) ? 0 : gTotalLogs - MAX_LOGS;
+                
+                for (int i = start; i < gTotalLogs; i++)
+                {
+                    char temp[64];
+                    int idx = i % MAX_LOGS;
+                    
+                    // Format: timestamp, type, temperature, voltage
+                    snprintf(temp, sizeof(temp), "%u,%d,%.1f,%.1f\n",
+                             gLogBuffer[idx].timestamp, gLogBuffer[idx].type,
+                             gLogBuffer[idx].temperature, gLogBuffer[idx].voltage);
+                    
+                    // Append to transmit buffer
+                    strcat(tx_buffer, temp);
+                }
+
+                xSemaphoreGive(gLogMutex); /* Unlock Mutex */
+            }
+
+            /* Send the data back to Thomas's Client */
+            lwip_sendto(sock, tx_buffer, strlen(tx_buffer), 0,
+                        (struct sockaddr *)&client_addr, client_len);
+        }
+    }
 }
 
-void AppSocket_startClient(void)
+/* Replaces AppSocket_startClient in the original file */
+void AppSocket_startServer(void)
 {
-    AppSocket_showMenu();
-    Appsocket_fillHostSocketInfo(&gHostInfo);
-    sys_thread_new("AppSocket_simpleClient", AppSocket_simpleClient, &gHostInfo.socketAddr, DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
+    /* Create Mutex */
+    gLogMutex = xSemaphoreCreateMutex();
+    EnetAppUtils_assert(gLogMutex != NULL);
+
+    /* Spawn Thread 1: Data Generator */
+    sys_thread_new("LogGenTask", AppSocket_dataGeneratorTask, NULL, 
+                   DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
+
+    /* Spawn Thread 2: UDP Server */
+    sys_thread_new("UdpSrvTask", AppSocket_udpServerTask, NULL, 
+                   DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
 }

@@ -34,6 +34,6 @@
 
 #include "lwip/sys.h"
 
-void AppSocket_startClient(void);
+void AppSocket_startServer(void);
 
 #endif /* _APP_SOCKET_H_ */

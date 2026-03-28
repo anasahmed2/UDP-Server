@@ -145,7 +145,7 @@ int appMain(void *args)
 
     DebugP_log("Network is UP ...\r\n");
     ClockP_sleep(1);
-    AppSocket_startClient();
+    AppSocket_startServer();
 
     while (1)
     {
