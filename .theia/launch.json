@@ -1,0 +1,16 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "enet_cpsw_udpclient_am243x-lp_r5fss0-0_freertos_ti-arm-clang",
+      "type": "ccs-debug",
+      "request": "launch",
+      "projectInfo": {
+        "name": "enet_cpsw_udpclient_am243x-lp_r5fss0-0_freertos_ti-arm-clang",
+        "resourceId": "/enet_cpsw_udpclient_am243x-lp_r5fss0-0_freertos_ti-arm-clang"
+      }
+    }
+  ]
+}
