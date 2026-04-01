@@ -93,6 +93,11 @@ static uint16_t calc_checksum(const uint8_t *buf, int len) {
     return sum;
 }
 
+/* Helper to read 16-bit int from Thomas's packet */
+static uint16_t read_u16(const uint8_t *b) {
+    return (uint16_t)((b[0] << 8) | b[1]);
+}
+
 /* ========================================================================== */
 /*                          Function Definitions                              */
 /* ========================================================================== */
@@ -131,108 +136,120 @@ static void AppSocket_dataGeneratorTask(void *pArg)
     }
 }
 
-/* THREAD 2: UDP Streaming Task (Broadcasts formatted packets) */
+/* THREAD 2: UDP Server Task (Listens & Responds to Thomas in Binary) */
 static void AppSocket_udpServerTask(void *pArg)
 {
     int32_t sock = -1, ret = 0;
-    struct sockaddr_in broadcast_addr;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    uint8_t rx_buffer[RX_BUFFER_SIZE];
     uint8_t tx_buffer[TX_BUFFER_SIZE];
 
-    EnetAppUtils_print("UDP Broadcast Thread Started on Port %d...\r\n", SERVER_UDP_PORT);
+    EnetAppUtils_print("UDP Server Thread Started on Port %d...\r\n", SERVER_UDP_PORT);
 
     /* Create the socket */
     sock = lwip_socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
-    {
-        EnetAppUtils_print("ERR: unable to open socket\r\n");
+    if (sock < 0) {
         vTaskDelete(NULL);
     }
 
-    /* Enable UDP Broadcasting on this socket */
-    int broadcast_enable = 1;
-    ret = lwip_setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable));
-    if (ret < 0) {
-        EnetAppUtils_print("ERR: Failed to enable broadcast\r\n");
-    }
+    /* Bind to 8016 */
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = PP_HTONS(SERVER_UDP_PORT);
+    server_addr.sin_addr.s_addr = PP_HTONL(INADDR_ANY);
 
-    /* Setup destination address: 255.255.255.255 */
-    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
-    broadcast_addr.sin_family = AF_INET;
-    broadcast_addr.sin_port = PP_HTONS(SERVER_UDP_PORT);
-    broadcast_addr.sin_addr.s_addr = PP_HTONL(INADDR_BROADCAST); 
+    lwip_bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
 
-    uint16_t sequence_num = 1;
-
-    /* Main Streaming Loop */
     while (1)
     {
-        /* Lock Mutex to safely read logs */
-        if (xSemaphoreTake(gLogMutex, portMAX_DELAY) == pdTRUE)
+        /* Block and wait for Thomas to press a key and send a request */
+        int len = lwip_recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0,
+                                (struct sockaddr *)&client_addr, &client_len);
+
+        if (len >= 14) // Thomas's header is at least 14 bytes
         {
-            // Send up to the last 10 logs
-            int logs_to_send = (gTotalLogs < 10) ? gTotalLogs : 10;
-            int start_idx = (gTotalLogs < 10) ? 0 : gTotalLogs - 10;
-            
-            for (int i = 0; i < logs_to_send; i++)
+            // 1. Verify Magic Number to ensure it's Thomas's software
+            if (read_u16(&rx_buffer[PKT_ID]) == PACKET_MAGIC) 
             {
-                int actual_idx = (start_idx + i) % MAX_LOGS;
-                LogItem_t *log = &gLogBuffer[actual_idx];
+                // 2. Extract his specific Sequence ID!
+                uint16_t req_seq = read_u16(&rx_buffer[PKT_SEQ]);
+                uint8_t  req_cmd = rx_buffer[PKT_CMD];
 
-                memset(tx_buffer, 0, sizeof(tx_buffer));
+                // PRINT: Who sent the request?
+                char client_ip[16];
+                ip4addr_ntoa_r((const ip4_addr_t *)&client_addr.sin_addr.s_addr, client_ip, sizeof(client_ip));
+                EnetAppUtils_print("\r\n--- Received Request from %s:%d ---\r\n", client_ip, ntohs(client_addr.sin_port));
+                EnetAppUtils_print("Client Sequence ID: %d, Command: %d\r\n", req_seq, req_cmd);
 
-                // 1. Format Payload (Thomas's LogEntry format)
-                uint8_t payload[256];
-                memset(payload, 0, sizeof(payload));
-                
-                payload[ENTRY_STATUS] = 0; // STATUS_OK
-                
-                // For demonstration, padding out timestamp to look like valid 64-bit ms
-                uint64_t fake_timestamp_ms = 1774890000000 + log->timestamp;
-                write_u64(&payload[ENTRY_TS], fake_timestamp_ms); 
-                
-                payload[ENTRY_TYPE] = log->type; // 0=ERROR, 1=WARNING, 2=INFO
-                
-                // Format the message string
-                char msg[MAX_MSG_LEN];
-                snprintf(msg, sizeof(msg), "Temp: %.1fC, Volts: %.1fV", log->temperature, log->voltage);
-                int msg_len = strlen(msg);
-                memcpy(&payload[ENTRY_MSG], msg, msg_len);
-                
-                uint16_t payload_len = ENTRY_MSG + msg_len;
+                /* Lock Mutex to safely read logs */
+                if (xSemaphoreTake(gLogMutex, portMAX_DELAY) == pdTRUE)
+                {
+                    int logs_to_send = (gTotalLogs < 10) ? gTotalLogs : 10;
+                    int start_idx = (gTotalLogs < 10) ? 0 : gTotalLogs - 10;
+                    
+                    EnetAppUtils_print("Packaging and sending %d logs...\r\n", logs_to_send);
 
-                // 2. Build Thomas's Header (14 bytes)
-                write_u16(&tx_buffer[PKT_ID], PACKET_MAGIC);
-                tx_buffer[PKT_CMD] = CMD_GET_ALL_LOGS;
-                write_u16(&tx_buffer[PKT_SEQ], sequence_num);
-                write_u16(&tx_buffer[PKT_TOT], logs_to_send);
-                write_u16(&tx_buffer[PKT_IDX], i); // Index of this specific log
-                write_u16(&tx_buffer[PKT_LEN], payload_len);
-                
-                // 3. Copy Payload into Packet
-                memcpy(&tx_buffer[PKT_DATA], payload, payload_len);
+                    for (int i = 0; i < logs_to_send; i++)
+                    {
+                        int actual_idx = (start_idx + i) % MAX_LOGS;
+                        LogItem_t *log = &gLogBuffer[actual_idx];
 
-                // 4. Calculate and Append Checksum
-                int total_pkt_len = PKT_DATA + payload_len + 2;
-                uint16_t checksum = calc_checksum(tx_buffer, total_pkt_len);
-                write_u16(&tx_buffer[PKT_DATA + payload_len], checksum);
+                        memset(tx_buffer, 0, sizeof(tx_buffer));
 
-                // 5. Blast data to the network
-                ret = lwip_sendto(sock, tx_buffer, total_pkt_len, 0,
-                                  (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
+                        // 3. Format Payload
+                        uint8_t payload[256];
+                        memset(payload, 0, sizeof(payload));
+                        
+                        payload[ENTRY_STATUS] = 0; 
+                        uint64_t fake_timestamp_ms = 1774890000000 + log->timestamp;
+                        write_u64(&payload[ENTRY_TS], fake_timestamp_ms); 
+                        payload[ENTRY_TYPE] = log->type; 
+                        
+                        char msg[MAX_MSG_LEN];
+                        snprintf(msg, sizeof(msg), "Temp: %.1fC, Volts: %.1fV", log->temperature, log->voltage);
+                        int msg_len = strlen(msg);
+                        memcpy(&payload[ENTRY_MSG], msg, msg_len);
+                        
+                        uint16_t payload_len = ENTRY_MSG + msg_len;
+
+                        // PRINT: Show exactly what text is going into this binary packet
+                        EnetAppUtils_print("  -> Pkt %d: Type=%d, %s\r\n", i, log->type, msg);
+
+                        // 4. Build Header - ECHOING HIS SEQUENCE ID
+                        write_u16(&tx_buffer[PKT_ID], PACKET_MAGIC);
+                        tx_buffer[PKT_CMD] = req_cmd;
+                        write_u16(&tx_buffer[PKT_SEQ], req_seq); 
+                        write_u16(&tx_buffer[PKT_TOT], logs_to_send);
+                        write_u16(&tx_buffer[PKT_IDX], i); 
+                        write_u16(&tx_buffer[PKT_LEN], payload_len);
+                        
+                        memcpy(&tx_buffer[PKT_DATA], payload, payload_len);
+
+                        // 5. Checksum and Send DIRECTLY back to WSL
+                        int total_pkt_len = PKT_DATA + payload_len + 2;
+                        uint16_t checksum = calc_checksum(tx_buffer, total_pkt_len);
+                        write_u16(&tx_buffer[PKT_DATA + payload_len], checksum);
+
+                        ret = lwip_sendto(sock, tx_buffer, total_pkt_len, 0,
+                                          (struct sockaddr *)&client_addr, client_len); 
+                        
+                        if (ret < 0) {
+                            EnetAppUtils_print("ERR: Failed to send packet %d\r\n", i);
+                        }
+                    }
+                    EnetAppUtils_print("Done sending response.\r\n");
+
+                    xSemaphoreGive(gLogMutex);
+                }
             }
-
-            if (logs_to_send > 0) {
-                EnetAppUtils_print("Broadcasted Sequence %d (%d logs) to network\r\n", sequence_num, logs_to_send);
-                sequence_num++;
+            else {
+                EnetAppUtils_print("Ignored packet: Invalid Magic Number\r\n");
             }
-
-            xSemaphoreGive(gLogMutex); /* Unlock Mutex */
         }
-
-        /* Sleep for 1 second before broadcasting the next batch */
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+
 
 /* Replaces AppSocket_startClient in the original file */
 void AppSocket_startServer(void)
