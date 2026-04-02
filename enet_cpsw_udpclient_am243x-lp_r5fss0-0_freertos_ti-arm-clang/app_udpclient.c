@@ -136,24 +136,22 @@ static void AppSocket_dataGeneratorTask(void *pArg)
     }
 }
 
-/* THREAD 2: UDP Server Task (Listens & Responds to Thomas in Binary) */
+/* THREAD 2: UDP Server Task (On-Demand Real-Time Streamer) */
 static void AppSocket_udpServerTask(void *pArg)
 {
-    int32_t sock = -1, ret = 0;
+    int32_t sock = -1;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
-    uint8_t rx_buffer[RX_BUFFER_SIZE];
-    uint8_t tx_buffer[TX_BUFFER_SIZE];
+    char rx_buffer[128];
+    char tx_buffer[TX_BUFFER_SIZE];
 
-    EnetAppUtils_print("UDP Server Thread Started on Port %d...\r\n", SERVER_UDP_PORT);
+    EnetAppUtils_print("UDP Streamer Started on Port %d...\r\n", SERVER_UDP_PORT);
 
-    /* Create the socket */
     sock = lwip_socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         vTaskDelete(NULL);
     }
 
-    /* Bind to 8016 */
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = PP_HTONS(SERVER_UDP_PORT);
@@ -161,95 +159,59 @@ static void AppSocket_udpServerTask(void *pArg)
 
     lwip_bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
 
+    EnetAppUtils_print("Waiting for Ingest Server to subscribe...\r\n");
+
+    /* 1. BLOCK until the Python server sends a trigger packet */
+    lwip_recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0,
+                  (struct sockaddr *)&client_addr, &client_len);
+
+    /* 2. We got a packet! Extract the IP automatically (No hardcoding!) */
+    char client_ip[16];
+    ip4addr_ntoa_r((const ip4_addr_t *)&client_addr.sin_addr.s_addr, client_ip, sizeof(client_ip));
+    EnetAppUtils_print("Server Subscribed from %s:%d. Starting live stream...\r\n", client_ip, ntohs(client_addr.sin_port));
+
+    /* 3. Stream data continuously */
     while (1)
     {
-        /* Block and wait for Thomas to press a key and send a request */
-        int len = lwip_recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0,
-                                (struct sockaddr *)&client_addr, &client_len);
-
-        if (len >= 14) // Thomas's header is at least 14 bytes
+        if (xSemaphoreTake(gLogMutex, portMAX_DELAY) == pdTRUE)
         {
-            // 1. Verify Magic Number to ensure it's Thomas's software
-            if (read_u16(&rx_buffer[PKT_ID]) == PACKET_MAGIC) 
+            int logs_to_send = (gTotalLogs < 10) ? gTotalLogs : 10;
+            int start_idx = (gTotalLogs < 10) ? 0 : gTotalLogs - 10;
+            
+            // Clear the entire buffer
+            memset(tx_buffer, 0, TX_BUFFER_SIZE);
+            int offset = 0; // Keep track of exactly where we are in the buffer
+
+            for (int i = 0; i < logs_to_send; i++)
             {
-                // 2. Extract his specific Sequence ID!
-                uint16_t req_seq = read_u16(&rx_buffer[PKT_SEQ]);
-                uint8_t  req_cmd = rx_buffer[PKT_CMD];
+                int actual_idx = (start_idx + i) % MAX_LOGS;
+                LogItem_t *log = &gLogBuffer[actual_idx];
 
-                // PRINT: Who sent the request?
-                char client_ip[16];
-                ip4addr_ntoa_r((const ip4_addr_t *)&client_addr.sin_addr.s_addr, client_ip, sizeof(client_ip));
-                EnetAppUtils_print("\r\n--- Received Request from %s:%d ---\r\n", client_ip, ntohs(client_addr.sin_port));
-                EnetAppUtils_print("Client Sequence ID: %d, Command: %d\r\n", req_seq, req_cmd);
-
-                /* Lock Mutex to safely read logs */
-                if (xSemaphoreTake(gLogMutex, portMAX_DELAY) == pdTRUE)
-                {
-                    int logs_to_send = (gTotalLogs < 10) ? gTotalLogs : 10;
-                    int start_idx = (gTotalLogs < 10) ? 0 : gTotalLogs - 10;
-                    
-                    EnetAppUtils_print("Packaging and sending %d logs...\r\n", logs_to_send);
-
-                    for (int i = 0; i < logs_to_send; i++)
-                    {
-                        int actual_idx = (start_idx + i) % MAX_LOGS;
-                        LogItem_t *log = &gLogBuffer[actual_idx];
-
-                        memset(tx_buffer, 0, sizeof(tx_buffer));
-
-                        // 3. Format Payload
-                        uint8_t payload[256];
-                        memset(payload, 0, sizeof(payload));
-                        
-                        payload[ENTRY_STATUS] = 0; 
-                        uint64_t fake_timestamp_ms = 1774890000000 + log->timestamp;
-                        write_u64(&payload[ENTRY_TS], fake_timestamp_ms); 
-                        payload[ENTRY_TYPE] = log->type; 
-                        
-                        char msg[MAX_MSG_LEN];
-                        snprintf(msg, sizeof(msg), "Temp: %.1fC, Volts: %.1fV", log->temperature, log->voltage);
-                        int msg_len = strlen(msg);
-                        memcpy(&payload[ENTRY_MSG], msg, msg_len);
-                        
-                        uint16_t payload_len = ENTRY_MSG + msg_len;
-
-                        // PRINT: Show exactly what text is going into this binary packet
-                        EnetAppUtils_print("  -> Pkt %d: Type=%d, %s\r\n", i, log->type, msg);
-
-                        // 4. Build Header - ECHOING HIS SEQUENCE ID
-                        write_u16(&tx_buffer[PKT_ID], PACKET_MAGIC);
-                        tx_buffer[PKT_CMD] = req_cmd;
-                        write_u16(&tx_buffer[PKT_SEQ], req_seq); 
-                        write_u16(&tx_buffer[PKT_TOT], logs_to_send);
-                        write_u16(&tx_buffer[PKT_IDX], i); 
-                        write_u16(&tx_buffer[PKT_LEN], payload_len);
-                        
-                        memcpy(&tx_buffer[PKT_DATA], payload, payload_len);
-
-                        // 5. Checksum and Send DIRECTLY back to WSL
-                        int total_pkt_len = PKT_DATA + payload_len + 2;
-                        uint16_t checksum = calc_checksum(tx_buffer, total_pkt_len);
-                        write_u16(&tx_buffer[PKT_DATA + payload_len], checksum);
-
-                        ret = lwip_sendto(sock, tx_buffer, total_pkt_len, 0,
-                                          (struct sockaddr *)&client_addr, client_len); 
-                        
-                        if (ret < 0) {
-                            EnetAppUtils_print("ERR: Failed to send packet %d\r\n", i);
-                        }
-                    }
-                    EnetAppUtils_print("Done sending response.\r\n");
-
-                    xSemaphoreGive(gLogMutex);
+                // Write directly into tx_buffer at the current offset.
+                // snprintf returns the number of characters it wrote.
+                int written = snprintf(tx_buffer + offset, TX_BUFFER_SIZE - offset, 
+                         "[TS:%u] Type:%d | Temp:%.1fC | Volt:%.1fV\n",
+                         log->timestamp, log->type, log->temperature, log->voltage);
+                
+                // Move the offset forward so the next loop writes AFTER this line
+                if (written > 0 && offset + written < TX_BUFFER_SIZE) {
+                    offset += written;
                 }
             }
-            else {
-                EnetAppUtils_print("Ignored packet: Invalid Magic Number\r\n");
+
+            // Blast the chunk of logs to the Python Server
+            if (offset > 0) {
+                lwip_sendto(sock, tx_buffer, offset, 0,
+                            (struct sockaddr *)&client_addr, client_len);
             }
+
+            xSemaphoreGive(gLogMutex);
         }
+
+        // Stream rate: 1 update per second
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
-
 
 /* Replaces AppSocket_startClient in the original file */
 void AppSocket_startServer(void)
